@@ -11,7 +11,6 @@ from typing import Any
 
 import aiohttp
 import httpx
-import uvloop
 from aiohttp import web
 
 # Configuration
@@ -35,7 +34,6 @@ async def handle_request(request):
 
 def run_server_worker():
     """Run a single server worker process."""
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
     app = web.Application()
     app.router.add_get('/', handle_request)
 
@@ -380,8 +378,6 @@ def generate_report(results_no_pool: dict[str, Any], results_with_pool: dict[str
     print(report)
 
 
-
-
 # ============================================================================
 # Main Entry Point
 # ============================================================================
@@ -418,8 +414,6 @@ def main():
             time.sleep(0.1)
 
     try:
-        # Use uvloop for better performance
-        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
