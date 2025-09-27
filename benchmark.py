@@ -11,7 +11,9 @@ from typing import Any
 
 import aiohttp
 import httpx
-from aiohttp import web
+from aiohttp import web, ClientSession, ClientTimeout, ClientResponse
+from httpx import AsyncByteStream, AsyncBaseTransport, Request, Response
+from typing import AsyncIterator
 
 # Configuration
 PORT = 8888
@@ -74,6 +76,51 @@ def stop_server(processes):
             p.join()
 
 
+# https://github.com/encode/httpx/issues/3215#issuecomment-2720838877
+class AiohttpResponseStream(AsyncByteStream):
+    CHUNK_SIZE = 1024
+
+    def __init__(self, aiohttp_response: ClientResponse) -> None:
+        self._aiohttp_response = aiohttp_response
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in self._aiohttp_response.content.iter_chunked(self.CHUNK_SIZE):
+            yield chunk
+
+    async def aclose(self) -> None:
+        await self._aiohttp_response.__aexit__(None, None, None)
+
+
+class AiohttpTransport(AsyncBaseTransport):
+    def __init__(self, session: ClientSession) -> None:
+        self.session = session
+
+    async def handle_async_request(self, request: Request) -> Response:
+        timeout_config = request.extensions.get("timeout", {})
+
+        response = await self.session.request(
+            method=request.method,
+            url=str(request.url),
+            headers=request.headers,
+            data=request.content,
+            allow_redirects=False,
+            auto_decompress=False,
+            compress=False,
+            timeout=ClientTimeout(
+                sock_connect=timeout_config.get("connect"),
+                sock_read=timeout_config.get("read"),
+                connect=timeout_config.get("pool"),
+            ),
+        ).__aenter__()
+
+        return Response(
+            status_code=response.status,
+            headers=response.headers,
+            content=AiohttpResponseStream(response),
+            request=request,
+        )
+
+
 # ============================================================================
 # Benchmark Functions
 # ============================================================================
@@ -101,6 +148,29 @@ async def benchmark_httpx_serial(n: int, connection_pool: bool = False) -> list[
             response = await client.get(URL)
             assert response.status_code == 200
             latencies.append(time.perf_counter() - start)
+    return latencies
+
+async def benchmark_httpx_with_aiohttp_transport_serial(n: int, connection_pool: bool = False) -> list[float]:
+    """Benchmark httpx with aiohttp transport and serial requests.
+
+    Args:
+        n: Number of requests to make
+        connection_pool: Whether to use connection pooling
+
+    Returns:
+        List of latencies in seconds
+    """
+    latencies = []
+    connector = aiohttp.TCPConnector(force_close=not connection_pool)
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        transport = AiohttpTransport(session)
+        async with httpx.AsyncClient(transport=transport) as client:
+            for _ in range(n):
+                start = time.perf_counter()
+                response = await client.get(URL)
+                assert response.status_code == 200
+                latencies.append(time.perf_counter() - start)
     return latencies
 
 
@@ -155,6 +225,35 @@ async def benchmark_httpx_parallel(batch_size: int, num_batches: int, connection
                 assert response.status_code == 200
 
             latencies.append(time.perf_counter() - batch_start)
+    return latencies
+
+
+async def benchmark_httpx_with_aiohttp_transport_parallel(batch_size: int, num_batches: int, connection_pool: bool = False) -> list[float]:
+    """Benchmark httpx with aiohttp transport and parallel requests.
+
+    Args:
+        batch_size: Number of parallel requests per batch
+        num_batches: Number of batches to run
+        connection_pool: Whether to use connection pooling
+
+    Returns:
+        List of batch completion times in seconds
+    """
+    latencies = []
+    connector = aiohttp.TCPConnector(force_close=not connection_pool)
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        transport = AiohttpTransport(session)
+        async with httpx.AsyncClient(transport=transport) as client:
+            for _ in range(num_batches):
+                batch_start = time.perf_counter()
+                tasks = [client.get(URL) for _ in range(batch_size)]
+                responses = await asyncio.gather(*tasks)
+
+                for response in responses:
+                    assert response.status_code == 200
+
+                latencies.append(time.perf_counter() - batch_start)
     return latencies
 
 
@@ -252,6 +351,10 @@ async def run_benchmarks(connection_pool: bool = False) -> dict[str, Any]:
     )
     results["aiohttp_serial"] = calculate_stats(aiohttp_serial)
 
+    print("  Testing httpx with aiohttp transport (serial)...")
+    httpx_aiohttp_serial = await benchmark_httpx_with_aiohttp_transport_serial(NUM_SERIAL_REQUESTS, connection_pool)
+    results["httpx_aiohttp_serial"] = calculate_stats(httpx_aiohttp_serial)
+
     # Parallel benchmarks
     print(
         f"\nRunning parallel benchmarks ({BATCH_SIZE} requests x {NUM_PARALLEL_BATCHES} batches)..."
@@ -263,6 +366,12 @@ async def run_benchmarks(connection_pool: bool = False) -> dict[str, Any]:
     )
     results["httpx_parallel_batch"] = calculate_stats(httpx_parallel)
 
+    print("  Testing httpx with aiohttp transport (parallel)...")
+    httpx_aiohttp_parallel = await benchmark_httpx_with_aiohttp_transport_parallel(
+        BATCH_SIZE, NUM_PARALLEL_BATCHES, connection_pool
+    )
+    results["httpx_aiohttp_parallel_batch"] = calculate_stats(httpx_aiohttp_parallel)
+
     print("  Testing aiohttp (parallel)...")
     aiohttp_parallel = await benchmark_aiohttp_parallel(
         BATCH_SIZE, NUM_PARALLEL_BATCHES, connection_pool
@@ -272,6 +381,9 @@ async def run_benchmarks(connection_pool: bool = False) -> dict[str, Any]:
     # Calculate per-request stats for parallel
     results["httpx_parallel_per_request"] = calculate_stats(
         [t / BATCH_SIZE for t in httpx_parallel]
+    )
+    results["httpx_aiohttp_parallel_per_request"] = calculate_stats(
+        [t / BATCH_SIZE for t in httpx_aiohttp_parallel]
     )
     results["aiohttp_parallel_per_request"] = calculate_stats(
         [t / BATCH_SIZE for t in aiohttp_parallel]
@@ -302,47 +414,47 @@ def generate_report(results_no_pool: dict[str, Any], results_with_pool: dict[str
 
 #### Without Connection Pooling
 
-| Metric | httpx | aiohttp |
-|--------|-------|---------|
-| Min (ms) | {results_no_pool['httpx_serial']['min']:.3f} | {results_no_pool['aiohttp_serial']['min']:.3f} |
-| Max (ms) | {results_no_pool['httpx_serial']['max']:.3f} | {results_no_pool['aiohttp_serial']['max']:.3f} |
-| Mean (ms) | {results_no_pool['httpx_serial']['mean']:.3f} | {results_no_pool['aiohttp_serial']['mean']:.3f} |
-| Median (ms) | {results_no_pool['httpx_serial']['median']:.3f} | {results_no_pool['aiohttp_serial']['median']:.3f} |
-| Stdev (ms) | {results_no_pool['httpx_serial']['stdev']:.3f} | {results_no_pool['aiohttp_serial']['stdev']:.3f} |
-| P95 (ms) | {results_no_pool['httpx_serial']['p95']:.3f} | {results_no_pool['aiohttp_serial']['p95']:.3f} |
-| P99 (ms) | {results_no_pool['httpx_serial']['p99']:.3f} | {results_no_pool['aiohttp_serial']['p99']:.3f} |
+| Metric | httpx | aiohttp | httpx + aiohttp |
+|--------|-------|---------|---------|
+| Min (ms) | {results_no_pool['httpx_serial']['min']:.3f} | {results_no_pool['aiohttp_serial']['min']:.3f} | {results_no_pool['httpx_aiohttp_serial']['min']:.3f} |
+| Max (ms) | {results_no_pool['httpx_serial']['max']:.3f} | {results_no_pool['aiohttp_serial']['max']:.3f} | {results_no_pool['httpx_aiohttp_serial']['max']:.3f} |
+| Mean (ms) | {results_no_pool['httpx_serial']['mean']:.3f} | {results_no_pool['aiohttp_serial']['mean']:.3f} | {results_no_pool['httpx_aiohttp_serial']['mean']:.3f} |
+| Median (ms) | {results_no_pool['httpx_serial']['median']:.3f} | {results_no_pool['aiohttp_serial']['median']:.3f} | {results_no_pool['httpx_aiohttp_serial']['median']:.3f} |
+| Stdev (ms) | {results_no_pool['httpx_serial']['stdev']:.3f} | {results_no_pool['aiohttp_serial']['stdev']:.3f} | | {results_no_pool['httpx_aiohttp_serial']['stdev']:.3f} |
+| P95 (ms) | {results_no_pool['httpx_serial']['p95']:.3f} | {results_no_pool['aiohttp_serial']['p95']:.3f} | {results_no_pool['httpx_aiohttp_serial']['p95']:.3f} |
+| P99 (ms) | {results_no_pool['httpx_serial']['p99']:.3f} | {results_no_pool['aiohttp_serial']['p99']:.3f} | | {results_no_pool['httpx_aiohttp_serial']['p99']:.3f} |
 
 #### With Connection Pooling
 
-| Metric | httpx | aiohttp |
-|--------|-------|---------|
-| Min (ms) | {results_with_pool['httpx_serial']['min']:.3f} | {results_with_pool['aiohttp_serial']['min']:.3f} |
-| Max (ms) | {results_with_pool['httpx_serial']['max']:.3f} | {results_with_pool['aiohttp_serial']['max']:.3f} |
-| Mean (ms) | {results_with_pool['httpx_serial']['mean']:.3f} | {results_with_pool['aiohttp_serial']['mean']:.3f} |
-| Median (ms) | {results_with_pool['httpx_serial']['median']:.3f} | {results_with_pool['aiohttp_serial']['median']:.3f} |
-| Stdev (ms) | {results_with_pool['httpx_serial']['stdev']:.3f} | {results_with_pool['aiohttp_serial']['stdev']:.3f} |
-| P95 (ms) | {results_with_pool['httpx_serial']['p95']:.3f} | {results_with_pool['aiohttp_serial']['p95']:.3f} |
-| P99 (ms) | {results_with_pool['httpx_serial']['p99']:.3f} | {results_with_pool['aiohttp_serial']['p99']:.3f} |
+| Metric | httpx | aiohttp | httpx + aiohttp |
+|--------|-------|---------|---------|
+| Min (ms) | {results_with_pool['httpx_serial']['min']:.3f} | {results_with_pool['aiohttp_serial']['min']:.3f} | {results_with_pool['httpx_aiohttp_serial']['min']:.3f} |
+| Max (ms) | {results_with_pool['httpx_serial']['max']:.3f} | {results_with_pool['aiohttp_serial']['max']:.3f} | {results_with_pool['httpx_aiohttp_serial']['max']:.3f} |
+| Mean (ms) | {results_with_pool['httpx_serial']['mean']:.3f} | {results_with_pool['aiohttp_serial']['mean']:.3f} | {results_with_pool['httpx_aiohttp_serial']['mean']:.3f} |
+| Median (ms) | {results_with_pool['httpx_serial']['median']:.3f} | {results_with_pool['aiohttp_serial']['median']:.3f} | {results_with_pool['httpx_aiohttp_serial']['median']:.3f} |
+| Stdev (ms) | {results_with_pool['httpx_serial']['stdev']:.3f} | {results_with_pool['aiohttp_serial']['stdev']:.3f} | {results_with_pool['httpx_aiohttp_serial']['stdev']:.3f} |
+| P95 (ms) | {results_with_pool['httpx_serial']['p95']:.3f} | {results_with_pool['aiohttp_serial']['p95']:.3f} | {results_with_pool['httpx_aiohttp_serial']['p95']:.3f} |
+| P99 (ms) | {results_with_pool['httpx_serial']['p99']:.3f} | {results_with_pool['aiohttp_serial']['p99']:.3f} | {results_with_pool['httpx_aiohttp_serial']['p99']:.3f} |
 
 ### Parallel Requests ({BATCH_SIZE} requests x {NUM_PARALLEL_BATCHES} batches)
 
 #### Without Connection Pooling - Batch Timing
 
-| Metric | httpx | aiohttp |
-|--------|-------|---------|
-| Min (ms) | {results_no_pool['httpx_parallel_batch']['min']:.3f} | {results_no_pool['aiohttp_parallel_batch']['min']:.3f} |
-| Max (ms) | {results_no_pool['httpx_parallel_batch']['max']:.3f} | {results_no_pool['aiohttp_parallel_batch']['max']:.3f} |
-| Mean (ms) | {results_no_pool['httpx_parallel_batch']['mean']:.3f} | {results_no_pool['aiohttp_parallel_batch']['mean']:.3f} |
-| Median (ms) | {results_no_pool['httpx_parallel_batch']['median']:.3f} | {results_no_pool['aiohttp_parallel_batch']['median']:.3f} |
+| Metric | httpx | aiohttp | httpx + aiohttp |
+|--------|-------|---------|---------|
+| Min (ms) | {results_no_pool['httpx_parallel_batch']['min']:.3f} | {results_no_pool['aiohttp_parallel_batch']['min']:.3f} | {results_no_pool['httpx_aiohttp_parallel_batch']['min']:.3f} |
+| Max (ms) | {results_no_pool['httpx_parallel_batch']['max']:.3f} | {results_no_pool['aiohttp_parallel_batch']['max']:.3f} | {results_no_pool['httpx_aiohttp_parallel_batch']['max']:.3f} |
+| Mean (ms) | {results_no_pool['httpx_parallel_batch']['mean']:.3f} | {results_no_pool['aiohttp_parallel_batch']['mean']:.3f} | {results_no_pool['httpx_aiohttp_parallel_batch']['mean']:.3f} |
+| Median (ms) | {results_no_pool['httpx_parallel_batch']['median']:.3f} | {results_no_pool['aiohttp_parallel_batch']['median']:.3f} | {results_no_pool['httpx_aiohttp_parallel_batch']['median']:.3f} |
 
 #### With Connection Pooling - Batch Timing
 
-| Metric | httpx | aiohttp |
-|--------|-------|---------|
-| Min (ms) | {results_with_pool['httpx_parallel_batch']['min']:.3f} | {results_with_pool['aiohttp_parallel_batch']['min']:.3f} |
-| Max (ms) | {results_with_pool['httpx_parallel_batch']['max']:.3f} | {results_with_pool['aiohttp_parallel_batch']['max']:.3f} |
-| Mean (ms) | {results_with_pool['httpx_parallel_batch']['mean']:.3f} | {results_with_pool['aiohttp_parallel_batch']['mean']:.3f} |
-| Median (ms) | {results_with_pool['httpx_parallel_batch']['median']:.3f} | {results_with_pool['aiohttp_parallel_batch']['median']:.3f} |
+| Metric | httpx | aiohttp | httpx + aiohttp |
+|--------|-------|---------|---------|
+| Min (ms) | {results_with_pool['httpx_parallel_batch']['min']:.3f} | {results_with_pool['aiohttp_parallel_batch']['min']:.3f} | {results_with_pool['httpx_aiohttp_parallel_batch']['min']:.3f} |
+| Max (ms) | {results_with_pool['httpx_parallel_batch']['max']:.3f} | {results_with_pool['aiohttp_parallel_batch']['max']:.3f} | {results_with_pool['httpx_aiohttp_parallel_batch']['max']:.3f} |
+| Mean (ms) | {results_with_pool['httpx_parallel_batch']['mean']:.3f} | {results_with_pool['aiohttp_parallel_batch']['mean']:.3f} | {results_with_pool['httpx_aiohttp_parallel_batch']['mean']:.3f} |
+| Median (ms) | {results_with_pool['httpx_parallel_batch']['median']:.3f} | {results_with_pool['aiohttp_parallel_batch']['median']:.3f} | {results_with_pool['httpx_aiohttp_parallel_batch']['median']:.3f} |
 
 ## Summary
 
@@ -356,7 +468,13 @@ def generate_report(results_no_pool: dict[str, Any], results_with_pool: dict[str
 - Serial: {((results_no_pool['aiohttp_serial']['mean'] - results_with_pool['aiohttp_serial']['mean']) / results_no_pool['aiohttp_serial']['mean'] * 100):.1f}% {"faster" if results_with_pool['aiohttp_serial']['mean'] < results_no_pool['aiohttp_serial']['mean'] else "slower"} with pooling
 - Parallel: {((results_no_pool['aiohttp_parallel_batch']['mean'] - results_with_pool['aiohttp_parallel_batch']['mean']) / results_no_pool['aiohttp_parallel_batch']['mean'] * 100):.1f}% {"faster" if results_with_pool['aiohttp_parallel_batch']['mean'] < results_no_pool['aiohttp_parallel_batch']['mean'] else "slower"} with pooling
 
+**httpx + aiohttp:**
+- Serial: {((results_no_pool['httpx_aiohttp_serial']['mean'] - results_with_pool['httpx_aiohttp_serial']['mean']) / results_no_pool['httpx_aiohttp_serial']['mean'] * 100):.1f}% {"faster" if results_with_pool['httpx_aiohttp_serial']['mean'] < results_no_pool['httpx_aiohttp_serial']['mean'] else "slower"} with pooling
+- Parallel: {((results_no_pool['httpx_aiohttp_parallel_batch']['mean'] - results_with_pool['httpx_aiohttp_parallel_batch']['mean']) / results_no_pool['httpx_aiohttp_parallel_batch']['mean'] * 100):.1f}% {"faster" if results_with_pool['httpx_aiohttp_parallel_batch']['mean'] < results_no_pool['httpx_aiohttp_parallel_batch']['mean'] else "slower"} with pooling
+
 ### Library Comparison
+
+#### aiohttp vs httpx
 
 **Without Connection Pooling:**
 - Serial: {"aiohttp" if results_no_pool['aiohttp_serial']['mean'] < results_no_pool['httpx_serial']['mean'] else "httpx"} is {abs(results_no_pool['httpx_serial']['mean'] - results_no_pool['aiohttp_serial']['mean']) / min(results_no_pool['httpx_serial']['mean'], results_no_pool['aiohttp_serial']['mean']) * 100:.1f}% faster
@@ -365,6 +483,16 @@ def generate_report(results_no_pool: dict[str, Any], results_with_pool: dict[str
 **With Connection Pooling:**
 - Serial: {"aiohttp" if results_with_pool['aiohttp_serial']['mean'] < results_with_pool['httpx_serial']['mean'] else "httpx"} is {abs(results_with_pool['httpx_serial']['mean'] - results_with_pool['aiohttp_serial']['mean']) / min(results_with_pool['httpx_serial']['mean'], results_with_pool['aiohttp_serial']['mean']) * 100:.1f}% faster
 - Parallel: {"aiohttp" if results_with_pool['aiohttp_parallel_batch']['mean'] < results_with_pool['httpx_parallel_batch']['mean'] else "httpx"} is {abs(results_with_pool['httpx_parallel_batch']['mean'] - results_with_pool['aiohttp_parallel_batch']['mean']) / min(results_with_pool['httpx_parallel_batch']['mean'], results_with_pool['aiohttp_parallel_batch']['mean']) * 100:.1f}% faster
+
+#### aiohttp vs httpx + aiohttp transport
+
+**Without Connection Pooling:**
+- Serial: {"aiohttp" if results_no_pool['aiohttp_serial']['mean'] < results_no_pool['httpx_aiohttp_serial']['mean'] else "httpx + aiohttp"} is {abs(results_no_pool['httpx_aiohttp_serial']['mean'] - results_no_pool['aiohttp_serial']['mean']) / min(results_no_pool['httpx_aiohttp_serial']['mean'], results_no_pool['aiohttp_serial']['mean']) * 100:.1f}% faster
+- Parallel: {"aiohttp" if results_no_pool['aiohttp_parallel_batch']['mean'] < results_no_pool['httpx_aiohttp_parallel_batch']['mean'] else "httpx + aiohttp"} is {abs(results_no_pool['httpx_aiohttp_parallel_batch']['mean'] - results_no_pool['aiohttp_parallel_batch']['mean']) / min(results_no_pool['httpx_aiohttp_parallel_batch']['mean'], results_no_pool['aiohttp_parallel_batch']['mean']) * 100:.1f}% faster
+
+**With Connection Pooling:**
+- Serial: {"aiohttp" if results_with_pool['aiohttp_serial']['mean'] < results_with_pool['httpx_aiohttp_serial']['mean'] else "httpx + aiohttp"} is {abs(results_with_pool['httpx_aiohttp_serial']['mean'] - results_with_pool['aiohttp_serial']['mean']) / min(results_with_pool['httpx_aiohttp_serial']['mean'], results_with_pool['aiohttp_serial']['mean']) * 100:.1f}% faster
+- Parallel: {"aiohttp" if results_with_pool['aiohttp_parallel_batch']['mean'] < results_with_pool['httpx_aiohttp_parallel_batch']['mean'] else "httpx + aiohttp"} is {abs(results_with_pool['httpx_aiohttp_parallel_batch']['mean'] - results_with_pool['aiohttp_parallel_batch']['mean']) / min(results_with_pool['httpx_aiohttp_parallel_batch']['mean'], results_with_pool['aiohttp_parallel_batch']['mean']) * 100:.1f}% faster
 """
 
     if update_readme:
