@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Benchmark comparing httpx and aiohttp HTTP client performance."""
 
+import argparse
 import asyncio
 import multiprocessing
 import statistics
@@ -286,7 +287,7 @@ async def run_benchmarks(connection_pool: bool = False) -> dict[str, Any]:
 # ============================================================================
 
 
-def generate_report(results_no_pool: dict[str, Any], results_with_pool: dict[str, Any]):
+def generate_report(results_no_pool: dict[str, Any], results_with_pool: dict[str, Any], update_readme: bool = False):
     """Generate markdown report comparing both configurations."""
     report = f"""# HTTP Client Benchmark: httpx vs aiohttp
 
@@ -368,13 +369,17 @@ def generate_report(results_no_pool: dict[str, Any], results_with_pool: dict[str
 - Parallel: {"aiohttp" if results_with_pool['aiohttp_parallel_batch']['mean'] < results_with_pool['httpx_parallel_batch']['mean'] else "httpx"} is {abs(results_with_pool['httpx_parallel_batch']['mean'] - results_with_pool['aiohttp_parallel_batch']['mean']) / min(results_with_pool['httpx_parallel_batch']['mean'], results_with_pool['aiohttp_parallel_batch']['mean']) * 100:.1f}% faster
 """
 
-    with open('README.md', 'w') as f:
-        f.write(report)
+    if update_readme:
+        with open('README.md', 'w') as f:
+            f.write(report)
+        print("\nREADME.md has been updated with the benchmark results.")
 
     print("\n" + "="*60)
     print("BENCHMARK COMPLETE")
     print("="*60)
     print(report)
+
+
 
 
 # ============================================================================
@@ -383,6 +388,12 @@ def generate_report(results_no_pool: dict[str, Any], results_with_pool: dict[str
 
 def main():
     """Main entry point."""
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Benchmark httpx vs aiohttp HTTP clients')
+    parser.add_argument('--update-readme', action='store_true',
+                        help='Run benchmark and update README.md with results')
+    args = parser.parse_args()
+
     print(f"Starting benchmark server on {URL} with {NUM_WORKERS} workers...")
 
     # Start server
@@ -425,7 +436,7 @@ def main():
         results_with_pool = loop.run_until_complete(run_benchmarks(True))
 
         # Generate comparison report
-        generate_report(results_no_pool, results_with_pool)
+        generate_report(results_no_pool, results_with_pool, update_readme=args.update_readme)
 
     finally:
         # Stop server
