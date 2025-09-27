@@ -1,0 +1,14 @@
+[project]
+name = "benchmark-httpx-vs-aiohttp"
+version = "0.1.0"
+description = "Benchmark comparing httpx and aiohttp performance"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx",
+    "aiohttp",
+    "uvloop",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
